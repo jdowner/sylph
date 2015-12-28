@@ -21,11 +21,26 @@ class Atom(object):
         return repr("{}:{}".format(self.__class__.__name__.lower(), self.value))
 
 
+class Expression(object):
+    def __init__(self, terms):
+        self.terms = terms
+
+    def __iter__(self):
+        return iter(self.terms)
+
+    def __repr__(self):
+        return "({})".format(' '.join(repr(t) for t in self.terms))
+
+    @property
+    def leader(self):
+        return self.terms[0]
+
+    @property
+    def args(self):
+        return self.terms[1:]
+
+
 class Keyword(Atom):
-    pass
-
-
-class Number(Atom):
     pass
 
 
@@ -33,49 +48,78 @@ class Symbol(Atom):
     pass
 
 
+class Literal(Atom):
+    pass
+
+
+class Number(Literal):
+    pass
+
+
+class String(Literal):
+    pass
+
+
 class Procedure(object):
-    def __call__(self, env, *args):
+    def __call__(self, env, vals):
         pass
 
 
-class Define(Procedure):
+class InternalProcedure(object):
+    def __call__(self, interp, env, *args):
+        pass
+
+
+class Define(InternalProcedure):
     def __call__(self, interp, env, args):
-        var, exp = args
-        env[var.value] = interp.eval(exp, env)
+        assert len(args) == 2
+
+        var = args[0]
+        exp = args[1]
+
+        if isinstance(var, Expression):
+            var = interp.eval(var)
+
+        env.set(var.value, interp.eval(exp))
 
 
-keywords = (
-        'define',
-        'format',
-        'if',
-        'lambda',
-        'quote',
-        'set!',
-        )
+class Lambda(InternalProcedure):
+    def __call__(self, interp, env, args):
+        assert len(args) == 2
+
+        args, expr = args
+
+        lambda_class = type('UserProc', (Procedure,), {})
+
+        def impl(_, env, vals):
+            local = dict(zip([a.value for a in args], vals))
+            local = Env(local=local, outer=env)
+            return interp.eval(expr, local)
+
+        setattr(lambda_class, '__call__', impl)
+
+        return lambda_class()
+
+
+#keywords = (
+#        'define',
+#        'format',
+#        'if',
+#        'lambda',
+#        'quote',
+#        'set!',
+#        )
 
 def parse(program):
     "Read a Scheme expression from a string."
     for expression in read_from_token_iter(iter(tokenize(program))):
         yield expression
 
+
 def tokenize(s):
     "Convert a string into a list of tokens."
     return s.replace('(',' ( ').replace(')',' ) ').split()
 
-
-def atom(token):
-    "Numbers become numbers; every other token is a symbol."
-    try:
-        return Number(int(token))
-    except ValueError:
-        pass
-
-    try:
-        return Number(float(token))
-    except ValueError:
-        pass
-
-    return Keyword(token) if token in keywords else Symbol(token)
 
 def read_from_token_iter(tokens):
     "Read an expression from a sequence of tokens."
@@ -84,10 +128,22 @@ def read_from_token_iter(tokens):
             break
 
         elif token == '(':
-            yield [t for t in read_from_token_iter(tokens)]
+            yield Expression([t for t in read_from_token_iter(tokens)])
 
         else:
-            yield atom(token)
+            try:
+                yield Number(int(token))
+                continue
+            except ValueError:
+                pass
+
+            try:
+                yield Number(float(token))
+                continue
+            except ValueError:
+                pass
+
+            yield Symbol(token)
 
 
 def standard_env():
@@ -96,8 +152,7 @@ def standard_env():
 
     def make_simple_proc(func):
         class SimpleProc(Procedure):
-            def __call__(self, interp, env, args):
-                log.debug('make_simple_proc:args :{}'.format(args))
+            def __call__(self, env, args):
                 return func(*args)
 
         return SimpleProc()
@@ -127,37 +182,51 @@ def standard_env():
             )
 
     for name, proc in simple_procs:
-        env[name] = proc
+        env.set(name, proc)
 
     def proc_begin(interp, env, args):
         evaluations = [interp.eval(a, env) for a in args]
         return evaluations[-1]
 
-    env.update({
-        'apply': lambda _, __, x: [x[0](y) for y in x[1:]],
-        'begin': proc_begin,
-        'car': lambda _, __, x: x[0],
-        'cdr': lambda _, __, x: x[1:],
-        'cons': lambda _, __, x: [x[0]] + x[1:],
-        'list': lambda _, __, x: list(x),
-        'list?': lambda _, __, x: isinstance(x,list),
-        'null?': lambda _, __, x: x == [],
-        'number?': lambda _, __, x: isinstance(x, Number),
-        'procedure?': lambda _, __, x: callable(x),
-        'symbol?': lambda _, __, x: isinstance(x, Symbol),
-    })
+    env.define_keyword('define', Define())
+    env.define_keyword('lambda', Lambda())
+
+#    env.update({
+#        'apply': lambda _, __, x: [x[0](y) for y in x[1:]],
+#        'begin': proc_begin,
+#        'car': lambda _, __, x: x[0],
+#        'cdr': lambda _, __, x: x[1:],
+#        'cons': lambda _, __, x: [x[0]] + x[1:],
+#        'list': lambda _, __, x: list(x),
+#        'list?': lambda _, __, x: isinstance(x,list),
+#        'null?': lambda _, __, x: x == [],
+#        'number?': lambda _, __, x: isinstance(x, Number),
+#        'procedure?': lambda _, __, x: callable(x),
+#        'symbol?': lambda _, __, x: isinstance(x, Symbol),
+#    })
     return env
 
 
-class Env(dict):
+class Env(object):
     "An environment: a dict of {'var':val} pairs, with an outer Env."
-    def __init__(self, parms=(), args=(), outer=None):
-        self.update(zip(parms, args))
+    def __init__(self, local=None, outer=None):
+        self.vars = dict() if local is None else local
+        self.keywords = set()
         self.outer = outer
+
+    def __repr__(self):
+        return repr(self.as_dict())
+
+    def as_dict(self):
+        vars = dict(self.vars)
+        if self.outer is not None:
+            vars.update(self.outer.as_dict())
+
+        return vars
 
     def find(self, var):
         "Find the innermost Env where var appears."
-        if var in self:
+        if var in self.vars:
             return self
 
         if self.outer is not None:
@@ -166,25 +235,38 @@ class Env(dict):
         raise UnknownVariable("unable to find '{}' variable".format(var))
 
     def get(self, key):
-        "Find the innermost Env where var appears."
-        if key in self:
-            return self
+        if key in self.vars:
+            return self.vars[key]
 
         if self.outer is not None:
-            return self.outer.find(key)
+            return self.outer.get(key)
 
         raise UnknownVariable("unable to get '{}' variable".format(key))
 
     def set(self, key, val):
-        if key in self:
-            self[key] = val
-            return
+        self.vars[key] = val
+
+    def is_symbol(self, symbol):
+        if symbol in self.vars:
+            return True
 
         if self.outer is not None:
-            self.outer.set(key, val)
-            return
+            return self.outer.is_symbol(symbol)
 
-        raise UnknownVariable("unable to set '{}' variable".format(key))
+        return False
+
+    def is_keyword(self, symbol):
+        if symbol in self.keywords:
+            return True
+
+        if self.outer is not None:
+            return self.outer.is_keyword(symbol)
+
+        return False
+
+    def define_keyword(self, keyword, proc):
+        self.keywords.add(keyword)
+        self.set(keyword, proc)
 
 
 global_env = standard_env()
@@ -209,139 +291,41 @@ class Interpreter(object):
                     dict(indent=self.indent),
                     )
 
-            "Evaluate an expression in an environment."
-            if isinstance(x, Symbol):      # variable reference
-                log.debug("variable: {}".format(x))
-                return env.find(x.value)[x.value]
-
-            if isinstance(x, Number):
-                log.debug("number: {}".format(x.value))
+            if isinstance(x, Literal):
+                log.debug("literal: {}".format(x))
                 return x.value
 
-            if not isinstance(x, list):  # constant literal
-                log.debug("literal: {}".format(x))
-                return x
+            if isinstance(x, Symbol):
+                log.debug("variable: {}".format(x))
+                return env.get(x.value)
 
-            # If we get to here, we must be dealing with a list.
-            key, args = x[0], x[1:]
+            if isinstance(x, Expression):
+                log.debug("expr: {}".format(x))
+                if env.is_symbol(x.leader.value):
+                    # Retrieve the value of the symbol
+                    val = env.get(x.leader.value)
 
-            # If the list consists of one element, evaluate it
-            if not args:
-                return self.eval(key, env)
+                    if isinstance(val, InternalProcedure):
+                        log.debug("iproc: {}".format(x))
+                        return val(self, env, x.args)
 
-            if isinstance(key, Keyword):
-                log.debug("keyword: {}".format(key))
+                    elif isinstance(val, Procedure):
+                        log.debug("eproc: {}".format(x))
+                        return val(env, [self.eval(a, env) for a in x.args])
 
-                if key.value == 'quote':
-                    log.debug("quote: {}".format(args))
-                    return args
+                    else:
+                        return val
 
-                if key.value == 'define':
-                    var, exp = args
-                    proc = Define()
-                    proc(self, env, args)
-                    return
+                else:
+                    # The symbol is not a procedure so evaluate it and
+                    # return the result. TODO what if there are trailing
+                    # arguments?
+                    return self.eval(x.leader, env)
 
-                    log.debug("define: {} {}".format(var.value, exp))
-                    env[var.value] = self.eval(exp, env)
-                    return
-
-                if key.value == 'set!':
-                    var, exp = args
-                    log.debug("set!: {} {}".format(var.value, exp))
-                    env.set(var.value, self.eval(exp, env))
-                    return
-
-                if key.value == 'lambda':
-                    parms, body = args
-                    log.debug("lambda: {} {}".format(parms, body))
-
-                    def procedure(*args):
-                        return self.eval(body, Env([p.value for p in parms], args, env))
-
-                    return procedure
-
-                if key.value == 'if':
-                    test, conseq, alt = args
-                    exp = conseq if self.eval(test, env) else alt
-                    log.debug("if: {} {} {}".format(test, conseq, alt))
-                    return self.eval(exp, env)
-
-                if key.value == 'format':
-                    dest, text = args
-                    text = self.eval(text, env)
-                    log.debug("format: {} {}".format(dest, text))
-                    print(text)
-                    return
-
-#            elif isinstance(key, Procedure):
-#                log.debug('proc: {}'.format(key))
-#                return key(self, env, args)
-
-            else: # (proc arg...)
-                log.debug('old proc: {}'.format(key))
-                proc = self.eval(key, env)
-                args = [self.eval(exp, env) for exp in args]
-
-                if not callable(proc):
-                    return [proc] + args
-
-                return proc(self, env, args)
+            raise ValueError(x)
 
         finally:
             self.indent -= 1
-
-_interpreter = Interpreter()
-eval = _interpreter.eval
-
-
-def parse_sexp(string):
-    """
-    >>> parse_sexp("(+ 5 (+ 3 5))")
-    [['+', '5', ['+', '3', '5']]]
-
-    """
-    sexp = [[]]
-    word = ''
-    in_str = False
-    for c in string:
-        if c == '(' and not in_str:
-            sexp.append([])
-        elif c == ')' and not in_str:
-            if word:
-                sexp[-1].append(word)
-                word = ''
-            temp = sexp.pop()
-            sexp[-1].append(temp)
-        elif c in (' ', '\n', '\t') and not in_str:
-            sexp[-1].append(word)
-            word = ''
-        elif c == '\"':
-            in_str = not in_str
-        else:
-            word += c
-    return sexp[0]
-
-################ Interaction: A REPL
-
-def repl(prompt='sylph> '):
-    "A prompt-read-eval-print loop."
-    interpreter = Interpreter()
-    while True:
-        try:
-            val = interpreter.eval(parse(input(prompt)))
-            if val is not None:
-                print(lispstr(val))
-
-        except (SystemExit, KeyboardInterrupt):
-            break
-
-def lispstr(exp):
-    "Convert a Python object back into a Lisp-readable string."
-    if  isinstance(exp, list):
-        return '(' + ' '.join(map(lispstr, exp)) + ')'
-    else:
-        return str(exp)
 
 
 def main(argv=sys.argv[1:]):
@@ -363,8 +347,7 @@ def main(argv=sys.argv[1:]):
     for file in args.files:
         code = open(file).read()
         for expression in parse(code):
-            interpreter.eval(expression, env)
-
+            print(interpreter.eval(expression, env))
 
 
 if __name__ == "__main__":
